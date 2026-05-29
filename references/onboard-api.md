@@ -7,14 +7,14 @@
 
 - API Base：`https://api.aicoming.top`
 
-### 登录换 token（第一步）
-`POST /api/v1/auth/login`，请求体 `{"username":"<账号>","password":"<密码>"}`，返回 `{"token":"<JWT>"}`。
-- 若该账号是供应商，登录会自动签发**带供应商能力的 token**。
-- 之后所有注册都用这个 token → **模型自动归属到这个账号对应的商家名下**（后端按 token 身份 `currentProvider` 关联，无需手动指定商家）。
-- 密码**仅用于这一步换取 token**，不存储、不打印。
-- 前置条件：账号必须**已是审核通过的供应商**。登录响应含 `has_provider` 布尔值：
-  - `false` → 账号还不是供应商。**引导去申请，不要继续上架**：申请页 `https://aicoming.top/merchant-apply.html`（提交商家资料+证件，管理员审核通过后才成为供应商）。申请接口是 `POST /api/v1/merchants/apply`，但涉及证件/头像文件上传，应让供应商在网页完成，skill 不代办。
-  - 注册接口 `POST /api/v1/provider/models` 对非供应商会返回 `404 provider profile required`。
+### 取得 token（第一步，按注册方式两路）
+所有后续请求都用 `Authorization: Bearer <token>`。token 决定模型归属（后端按 token 的 user_id 解析其 provider，自动落本人商家）。
+
+- **账号密码用户**：`POST /api/v1/auth/login` `{"username","password"}` → `{"data":{"token"}}`。密码仅用于换 token，不存储。登录响应 `data.user.has_provider` 表明是否供应商。
+- **Google / GitHub（OAuth）用户**：**没有密码，CLI 无法替其登录**。让其在浏览器登录 `aicoming.top` 控制台后，复制 localStorage 里 `aic_token` 的值（即 JWT）粘贴使用。这条对所有登录方式都通用。
+- OAuth 走 `/api/v1/auth/oauth/:provider/callback`（浏览器重定向流程），无法在 CLI 完成——所以 OAuth 用户只能粘贴已登录的 token。
+
+**校验供应商资格**（任一路拿到 token 后）：`GET /api/v1/provider/dashboard`（带 Bearer）→ 返回 `provider` 非空即供应商；为 null/401 → 不是供应商，引导去申请页 `https://aicoming.top/merchant-apply.html`（申请接口 `POST /api/v1/merchants/apply`，含证件/头像上传，让供应商在网页做，skill 不代办）。非供应商调 `POST /api/v1/provider/models` 会返回 `404 provider profile required`。
 
 ### 完整 URL 约定（重要）
 注册每个模型时，**提交完整的端点 URL + `path_prefix="__raw__"`**，让平台原样使用、不再拼接：

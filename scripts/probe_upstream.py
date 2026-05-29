@@ -57,21 +57,28 @@ def _req(url, key, method="GET", body=None, stream=False, timeout=60, auth=None)
         return 0, f"__error__:{type(e).__name__}:{e}"
 
 
-def detect_auth(base, key):
-    """探测上游接受哪种认证：bearer / header / query。返回 (auth, 依据)。"""
-    # 优先用 /models（不花钱）。200 = 该认证被接受。
-    for a in ("bearer", "header", "query"):
-        st, _ = _req(f"{base}/models", key, auth=a)
-        if st == 200:
-            return a, f"/models 200 via {a}"
-    # /models 不可用 → 各认证打一个极小 chat；非 401/403 视为认证通过。
-    for a in ("bearer", "header", "query"):
-        st, _ = _req(f"{base}/chat/completions", key, "POST",
-                     {"model": "probe", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
-                     auth=a)
-        if st not in (401, 403, 0):
-            return a, f"chat {st} via {a}（非 401/403 视为认证通过）"
-    return "bearer", "未能确认，默认 bearer（认证方式可能特殊，需向供应商确认）"
+def resolve_base_auth(base, key):
+    """同时探测「有效 base」(是否需要补 /v1) 和「认证方式」(bearer/header/query)。
+    不写死 /v1：先试供应商给的 base，再试 base+/v1。返回 (有效base, auth, 依据, models可用)。"""
+    base = base.rstrip("/")
+    bases = [base]
+    if not base.lower().endswith("/v1"):
+        bases.append(base + "/v1")
+    # 优先用 /models（不花钱）：哪个 base×auth 组合 200，就定了 base 和 auth。
+    for b in bases:
+        for a in ("bearer", "header", "query"):
+            st, _ = _req(f"{b}/models", key, auth=a)
+            if st == 200:
+                return b, a, f"/models 200 @ {b} via {a}", True
+    # /models 不可用 → 用极小 chat ping 探（非 401/403/404 视为该 base+auth 通）。
+    for b in bases:
+        for a in ("bearer", "header", "query"):
+            st, _ = _req(f"{b}/chat/completions", key, "POST",
+                         {"model": "probe", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                         auth=a)
+            if st not in (401, 403, 404, 0):
+                return b, a, f"chat {st} @ {b} via {a}（非401/403/404视为通）", False
+    return base, "bearer", "未能确认 base/auth，默认（需向供应商确认完整端点与认证方式）", False
 
 
 def discover_models(base, key):
@@ -388,24 +395,26 @@ def probe_one(base, key, model, mtype, do_image, auth="bearer"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True, help="上游 Base URL，到 /v1 为止")
+    ap.add_argument("--base", required=True, help="上游 Base URL（host 或到 /v1 都行，脚本自动判断是否补 /v1）")
     ap.add_argument("--key", required=True, help="上游 API key")
     ap.add_argument("--model", help="只探测这一个模型；不传则探测 /models 发现的**全部**模型")
     ap.add_argument("--image", action="store_true", help="探测图片模型（文生图+图生图，会产生真实费用）")
     args = ap.parse_args()
-    base = args.base.rstrip("/")
+    raw_base = args.base.rstrip("/")
 
-    # 先探测认证方式（bearer/header/query），后续所有请求复用
-    auth, auth_basis = detect_auth(base, args.key)
+    # 自动探测有效 base(是否补/v1) + 认证方式，后续所有请求复用有效 base。
+    base, auth, basis, _ = resolve_base_auth(raw_base, args.key)
     _AUTH[0] = auth
 
     disc = discover_models(base, args.key)
-    report = {"base_url": base, "auth_type": {"detected": auth, "basis": auth_basis},
+    report = {"input_base": raw_base, "effective_base": base,
+              "auth_type": {"detected": auth, "basis": basis},
               "models": disc, "results": []}
 
     targets = [args.model] if args.model else disc["models"]
     if not targets:
-        report["note"] = "拿不到模型清单（/models 不可用），且未指定 --model。请让供应商提供模型清单后用 --model 逐个探测。"
+        report["note"] = ("拿不到模型清单（该上游无 /models，如 subrouter.ai）。"
+                          "请让供应商直接提供模型清单，再用 --model 逐个探测。不要去爬网站。")
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 

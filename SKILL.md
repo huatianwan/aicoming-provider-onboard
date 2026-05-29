@@ -18,27 +18,36 @@ description: 引导 API 供应商把自己的模型自助上架到 AIComing 供�
 
 ## 工作流（严格按顺序，每步等回答）
 
-### 步骤 1 — 登录（账号 → 密码 → 换 token）
-依次（**一项一项问**）：
-1. 问：你的 AIComing 账号（用户名）？—— 等回答。
-2. 问：密码？（说明：仅用于登录换取 token，不会保存）—— 等回答。
-3. 调登录接口换 token：
-   ```bash
-   curl -sS -X POST https://api.aicoming.top/api/v1/auth/login \
-     -H "Content-Type: application/json" \
-     -d '{"username":"<账号>","password":"<密码>"}'
-   ```
-   - 取返回里的 `token`。登录失败 → 告知重输，别继续。
-   - 该 token 决定模型归属：后续注册都用它 → **自动落到这个账号对应的商家名下**（后端按 token 的 user_id 解析其 provider，客户端无法指定别的商家）。
-4. **检查登录响应里的 `data.user.has_provider`**（注意：在 `user` 对象里，不是顶层）：
-   - `has_provider == true` → 继续步骤 2。
-   - `has_provider == false`（或为空）→ **这个账号还不是供应商，停止，别往下走**。明确告知：
-     > 你的账号还不是供应商，需要先申请入驻。请到 **https://aicoming.top/merchant-apply.html** 提交商家资料（名称、类型、证件等），等管理员审核通过后，再回来用这个 skill 上架模型。
-   - 不要替供应商走申请（申请涉及证件/头像等文件上传，在网页上做）；skill 只在已是供应商时才继续。
+### 步骤 1 — 取得 token（按注册方式分两路）
+先问：你是**账号密码**注册的，还是用 **Google / GitHub** 登录的？
+
+**A. Google/GitHub（OAuth）用户 —— 没有密码，走粘贴 token（也是通用方式）**
+1. 让其在浏览器登录 `https://aicoming.top` 控制台。
+2. 让其打开开发者工具 → Application/存储 → localStorage → 复制 key 为 **`aic_token`** 的值，粘贴给你。
+3. 这个 token 即身份；OAuth 登录拿不到密码，所以 CLI 无法替他登录，只能他自己登录后给 token。
+
+**B. 账号密码用户 —— 可直接换 token（也可同 A 粘贴 token）**
+```bash
+curl -sS -X POST https://api.aicoming.top/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"<账号>","password":"<密码>"}'
+```
+取返回 `data.token`。密码仅用于换 token，不保存、不打印。
+
+**两路共同点**：token 决定模型归属——后续注册都用它，后端按 token 的 user_id 解析其 provider，**自动落到本人商家名下**，无法指定别的商家。
+
+**校验供应商资格**（拿到 token 后，任一路都要做）：用 token 调
+```bash
+curl -sS https://api.aicoming.top/api/v1/provider/dashboard -H "Authorization: Bearer <TOKEN>"
+```
+- 返回里有 provider 数据 / `has_provider==true` → 是供应商，继续步骤 2。
+- `provider` 为 null / 401 / 提示无供应商 → **不是供应商，停下**，告知：
+  > 你的账号还不是供应商，先到 **https://aicoming.top/merchant-apply.html** 申请入驻（提交商家资料/证件），管理员审核通过后再回来上架。
+- 不替供应商走申请（涉及证件/头像上传，在网页做）。
 
 ### 步骤 2 — 上游连接信息（base_url → key）
 依次问：
-1. 问：你的上游 Base URL（到 `/v1` 为止，如 `https://api.xxx.com/v1`）？—— 等回答。
+1. 问：你的上游 Base URL？—— 等回答。**不强求到 `/v1`**：给 host(`https://api.xxx.com`)或带前缀(`.../v1`、`.../v2`)都行，探测脚本会自动判断要不要补 `/v1`、并探出真实可用的完整端点。
 2. 问：上游 API key？—— 等回答。
 
 ### 步骤 3 — 发现并探测全部模型
@@ -48,7 +57,11 @@ python scripts/probe_upstream.py --base <BASE_URL> --key <KEY>
 ```
 输出 `auth_type`（自动探测的认证方式，bearer/header/query，供应商不用手填）+ `results[]`，每个模型含：`model_type`、`assessment.verdict`、`issues`、`register_hint`（**完整 URL** + `__raw__` + `auth_type` + 建议字段）。判定与契约见 `references/aicoming-contract.md`。
 
-若 `/models` 不可用（脚本会在 `note` 提示）：问供应商要模型清单，然后**对清单里每个模型各跑一次** `--model <模型>`，逐个探测。
+**没有 `/models` 接口时（如 subrouter.ai，脚本 `note` 会提示）**：
+1. 先问供应商："你的 API 有列模型的接口吗（如 /models）？" —— 有就给路径，脚本会用上。
+2. 没有 → **直接让供应商提供模型清单**（他最清楚自己有哪些模型，这是最快最准的来源）。
+3. 然后对清单里每个模型 `--model <模型>` 逐个探测。
+4. **不要去爬供应商网站**——每个站结构不同、易变、抓到的可能是展示名而非真实 API 模型 ID，不可靠。顶多在供应商**明确给一个文档/价目页 URL**时，抓那**一个**页面辅助提取候选模型名，且**必须他确认**，绝不全站爬、绝不当权威来源。
 
 若发现里有**图片模型**：问供应商"是否现在实测图片模型（文生图+图生图，会产生几分钱费用）？"——同意后对图片模型补跑：
 ```bash
