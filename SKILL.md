@@ -1,125 +1,130 @@
 ---
 name: aicoming-provider-onboard
-description: 引导 API 供应商把自己的模型自助上架到 AIComing 供应商平台。用供应商的账号密码登录换取 token（模型自动归属到其商家名下），自动发现其上游全部模型、逐个探测格式/能力、对照 AIComing 契约判定兼容性，把兼容的模型以完整 URL 注册为端点（落 pending 待管理员审核）。触发场景：(1) 供应商想接入/上架模型到 AIComing；(2) 提到"上架模型""接入 aicoming""供应商对接""onboard provider""注册端点到 aicoming"；(3) 需要检测某个上游 API 是否兼容 AIComing。
+description: 帮 API 供应商在 AIComing 供应商平台做两件事——【提交模型】把上游模型上架（落 pending 待审），【管理模型】对已上架模型改价/改配置、下架、重新上架、删除。用供应商自己的 token 操作（模型自动归属其商家）。触发场景：(1)"上架/提交模型到 aicoming""供应商对接""onboard provider"；(2)"改价/改配置/下架/重新上架/删除我的模型"；(3) 需要把某个上游 API 的模型接入或管理 AIComing。
 ---
 
-# AIComing 供应商自助上架
+# AIComing 供应商上架与管理
 
-引导供应商：登录 → 发现全部模型 → 逐个探测判兼容 → 注册（pending，归属其商家）→ 报告。
+这个 skill 只做两件事，开场先问供应商要做哪件：
 
-## 两条铁律
+- **A. 提交模型** —— 把上游一个模型上架（→ pending，待管理员审核）。
+- **B. 管理模型** —— 对已有模型改价/改配置、下架、重新上架、删除。
 
-1. **一步一步引导，一次只问一项**：问完一项，**停下、等供应商回答**，再问下一项。**绝不一次甩一大堆字段让人填**，避免供应商填乱。每问一项给一句话示例。
-   - **强制**：每一项输入（账号、密码、base_url、key、定价…）都**必须明确提问并等待用户输入**。即使你（agent）有别的办法拿到这些值（能查库、能解密、上下文里已有），也**绝不允许**自行填入或批量执行——必须让供应商自己提供。这是引导式上架，不是脚本批跑。
-   - 每个 `curl`/脚本只在**拿到该步所需的用户输入后**才执行。
-2. **注册前必须把请求体给供应商确认**再 POST。所有端点落 `pending`，需管理员审核才上线，不直接进生产路由。
-   - 账号密码**只用于调登录接口换 token**，token 用完即用，**不存储、不打印密码**。
-   - 图片探测会产生**真实生图费用**，必须先征得同意。
+## 三条铁律
 
-## 工作流（严格按顺序，每步等回答）
+1. **一步一步，一次只问一项**：问完一项停下等回答，再问下一项。绝不一次甩一堆字段。每项给一句话示例。
+2. **绝不自己填用户该提供的值**：token、base_url、key、价格……即使你能查库/解密/上下文已有，也**必须让供应商自己给**。这是引导，不是脚本批跑。
+3. **任何写操作（提交/改价/下架/删除）前，把将要提交的请求体给供应商确认再发**。账号密码只用于换 token，不存储、不打印；删除等不可逆操作尤其要确认。
 
-### 步骤 1 — 取得 token（按注册方式分两路）
-先问：你是**账号密码**注册的，还是用 **Google / GitHub** 登录的？
+## 通用第 0 步 —— 取 token + 校验资格
 
-**A. Google/GitHub（OAuth）用户 —— 没有密码，走粘贴 token（也是通用方式）**
-1. 让其在浏览器登录 `https://aicoming.top` 控制台。
-2. 让其打开开发者工具 → Application/存储 → localStorage → 复制 key 为 **`aic_token`** 的值，粘贴给你。
-3. 这个 token 即身份；OAuth 登录拿不到密码，所以 CLI 无法替他登录，只能他自己登录后给 token。
+先拿到供应商 token（决定模型归属，后端按 token 的 user_id 落到本人商家）：
 
-**B. 账号密码用户 —— 可直接换 token（也可同 A 粘贴 token）**
-```bash
-curl -sS -X POST https://api.aicoming.top/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"<账号>","password":"<密码>"}'
-```
-取返回 `data.token`。密码仅用于换 token，不保存、不打印。
+- **账号密码用户**：`POST https://api.aicoming.top/api/v1/auth/login {"username","password"}` → 取 `data.token`。
+- **Google/GitHub（OAuth）用户**：没有密码，让其浏览器登录 `aicoming.top` 控制台 → 开发者工具 → localStorage → 复制 `aic_token` 的值粘贴。（此法对所有人通用。）
 
-**两路共同点**：token 决定模型归属——后续注册都用它，后端按 token 的 user_id 解析其 provider，**自动落到本人商家名下**，无法指定别的商家。
-
-**校验供应商资格**（拿到 token 后，任一路都要做）：用 token 调
+校验是不是供应商：
 ```bash
 curl -sS https://api.aicoming.top/api/v1/provider/dashboard -H "Authorization: Bearer <TOKEN>"
 ```
-- 返回里有 provider 数据 / `has_provider==true` → 是供应商，继续步骤 2。
-- `provider` 为 null / 401 / 提示无供应商 → **不是供应商，停下**，告知：
-  > 你的账号还不是供应商，先到 **https://aicoming.top/merchant-apply.html** 申请入驻（提交商家资料/证件），管理员审核通过后再回来上架。
-- 不替供应商走申请（涉及证件/头像上传，在网页做）。
+- 有 provider 数据 / `has_provider==true` → 继续。
+- null / 401 → 不是供应商，停下，告知去 **https://aicoming.top/merchant-apply.html** 申请入驻（含证件上传，在网页做，不代办）。
 
-### 步骤 2 — 上游连接信息（base_url → key）
-依次问：
-1. 问：你的上游 Base URL？—— 等回答。**不强求到 `/v1`**：给 host(`https://api.xxx.com`)或带前缀(`.../v1`、`.../v2`)都行，探测脚本会自动判断要不要补 `/v1`、并探出真实可用的完整端点。
-2. 问：上游 API key？—— 等回答。
+---
 
-### 步骤 3 — 发现并探测全部模型
-跑探测脚本（**不传 --model 即探测 `/models` 发现的全部模型**；先不含图片以免花钱）：
+## A. 提交模型
+
+### A1. 收集这一个模型的信息（逐项问）
+1. 上游 **Base URL**？（host 或带 `/v1`/`/v2` 都行，不强求到 /v1）
+2. 上游 **API key**？
+3. 这次要上的**模型名**（上游真实模型 ID）？
+4. 模型**类型**（chat / image / embedding…）？
+
+### A2.（可选）探测验证——拿不准是否兼容时才用
+供应商若不确定格式对不对、或想先验证能不能跑通，再用探测脚本；**他清楚自己接口的，可跳过直接填表**。
 ```bash
-python scripts/probe_upstream.py --base <BASE_URL> --key <KEY>
+python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --model <模型> [--image]
 ```
-输出 `auth_type`（自动探测的认证方式，bearer/header/query，供应商不用手填）+ `results[]`，每个模型含：`model_type`、`assessment.verdict`、`issues`、`register_hint`（**完整 URL** + `__raw__` + `auth_type` + 建议字段）。判定与契约见 `references/aicoming-contract.md`。
+- 输出 `auth_type`（认证方式）、`assessment.verdict`（compatible/needs_attention/unusable）、`register_hint`（完整 URL + `__raw__` + 建议字段）。判定与契约见 `references/aicoming-contract.md`。
+- 图片模型加 `--image` 会**真实生图、产生费用**，须先征得同意；判 compatible 需文生图+图生图都过。
+- 不传 `--model` 可探 `/models` 全量；没有 /models 接口就让供应商直接报模型清单，**不要爬网站**。
 
-**没有 `/models` 接口时（如 subrouter.ai，脚本 `note` 会提示）**：
-1. 先问供应商："你的 API 有列模型的接口吗（如 /models）？" —— 有就给路径，脚本会用上。
-2. 没有 → **直接让供应商提供模型清单**（他最清楚自己有哪些模型，这是最快最准的来源）。
-3. 然后对清单里每个模型 `--model <模型>` 逐个探测。
-4. **不要去爬供应商网站**——每个站结构不同、易变、抓到的可能是展示名而非真实 API 模型 ID，不可靠。顶多在供应商**明确给一个文档/价目页 URL**时，抓那**一个**页面辅助提取候选模型名，且**必须他确认**，绝不全站爬、绝不当权威来源。
+### A3. 定价（强制，逐项问）
+- **单位/币种讲清**（否则差千倍）：token 类 **¥/百万 token**（input/output）、image **¥/张**、按次 **¥/次**；**默认人民币**。
+- **售价必须问供应商**（他的加价决定，探不出来）。缺价**绝不**填 0 或猜——后端会回退默认价、算错账；给不出价就存草稿（`POST /provider/drafts`）或跳过。
+- 报价是美元 → 问当日汇率，`python scripts/usd_to_cny.py --rate <汇率> '<USD价格JSON>'` 折人民币，折算前后给供应商对照确认。
+- 想省手填**成本**可选试 `python scripts/fetch_pricing.py --base <中转host> --rate <汇率> --model <模型>`（new-api 公开 pricing 才抓得到，多数需登录则手填）。
 
-若发现里有**图片模型**：问供应商"是否现在实测图片模型（文生图+图生图，会产生几分钱费用）？"——同意后对图片模型补跑：
-```bash
-python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --model <图片模型> --image
-```
-图片模型判 `compatible` 需文生图+图生图都 200。
+### A4. 厂商 slug（必填）
+`model_vendor_slug` 必填（只给 name 会 400）。探测的 `register_hint` 已自动分辨（`vendor_basis` 说明依据），通常直接用；**仅当为空**才问供应商属于哪家（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。优先复用平台已有同名模型的 slug，别乱起新 slug。
 
-### 步骤 4 — 呈现兼容性清单
-把 `results` 用中文列给供应商（每个模型一行）：
-- ✅ `compatible`：可上架。
-- ⚠️ `needs_attention`：可上架但有不阻断问题（缺 usage / 返 url / 仅文生图等）——注明。
-- ❌ `unusable`：**按完整 URL 实测判定，不看模型名**。两种情况：① 主接口非 200（路径/认证/格式不对）；② 200 但响应不是 OpenAI 结构（真原生协议如 Gemini `candidates`/Anthropic `content`——平台翻请求但**不回译响应**）。如实告知需上游提供 OpenAI 格式入口，不要假装能修。
-  - 注意：模型名叫 gemini/claude **不等于** unusable——多数中转商的 gemini/claude 是 OpenAI 格式暴露的，探测能过就兼容。
-- `needs_manual_check`/`needs_image_probe`：未覆盖类型或图片未实测，提示补测。
-
-### 步骤 5 — 逐个模型上架（一次一个，别批量）
-**对每个可上架的模型，单独走一遍**，不要一次性处理全部：
-1. 报这个模型的探测结论，问：这个上架吗？—— 等回答。
-2. 定价。**单位/币种说明**（必须讲清，否则差 1000 倍）：单位 token 类 **¥/百万(1M) token**、image **¥/张**、按次 **¥/次**；**币种默认人民币**，若来源是美元则用 `usd_to_cny.py` 折成人民币。
-   - **先尝试从中转抓"上游成本"**（省得手填成本）：
-     ```bash
-     python scripts/fetch_pricing.py --base <中转host> --rate <汇率> --model <模型>
-     ```
-     - 抓到（中转 `/api/pricing` 公开）→ 得到 `upstream_input_cost/output_cost`(已折人民币) 作为**成本建议**，给供应商确认。
-     - 返回"需登录"（如 ccapi 401）→ 让供应商从其中转控制台给个**网站登录 token**(`--token`)，或直接口头报成本。
-     - 抓不到 → 手动问成本。
-   - **售价（input_price/output_price 等）抓不到、必须问供应商**（这是他的加价决定，不是中转标价）。
-   - **定价是强制项**：缺价**绝不**用 0 或猜值提交（后端会回退平台默认价、成本算 0 → 算错账）。
-   - 供应商给不出价 → **不注册**：① 跳过，收尾标"待补价"；② 存草稿 `POST /api/v1/provider/drafts {name, form_data}` 保留已探配置，拿到价再提交。
-3. **若报价是美元**：问当日 USD→CNY 汇率（让其确认），折算：
-   ```bash
-   python scripts/usd_to_cny.py --rate <汇率> '<USD价格字段JSON>'
-   ```
-   把折算后 CNY 值用于注册，`note` 写"原始 USD，按 <汇率> 折算"。**折算前后对照给供应商确认**。
-4. 用 `register_hint`（**完整 upstream_url + path_prefix=__raw__** + `auth_type`(探测得出) + `model_vendor_slug`；图片再带 `upstream_edit_url`/`upstream_edit_model`）+ 定价 + 探测结果，拼 `providerModelRequest`（字段见 `references/onboard-api.md`）。
-   - **`model_vendor_slug` 必填**（只给 name 会 400）。register_hint 已**自动分辨**（多信号：模型名优先，owned_by 兜底；`vendor_basis` 字段说明依据）——通常直接用即可。**仅当它为空**（`vendor_basis`="无法自动分辨")才问供应商属于哪个厂商（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。
-   - **slug 优先复用平台已有模型**：若平台已有同名/对应模型（如 `gpt-4o`），`slug` 用平台的，让端点挂到正确目录下；**别乱起新 slug**（会新建一个垃圾目录模型）。`name`/`type`/`category` 也尽量对齐平台已有模型。
-   - `auth_type` 用探测报告里的 `auth_type.detected`（bearer/header/query）；若探测显示"未能确认"，问供应商其上游用哪种认证。
-5. **注册前先查重**：用 `GET /api/v1/provider/models`（带 token）看这个模型是否**已注册且 active**。
-   - 已 active → **警告供应商**：重新注册会删旧端点、打回 pending、期间掉线；要改配置应走「变更请求」而非重注册。除非他明确要重建，否则跳过。
-   - 不存在或仅 pending/草稿 → 正常继续。
-6. **把完整请求体给供应商确认**，确认后 POST（用步骤 1 的 token）：
+### A5. 查重 → 确认 → 提交
+1. 查重：`GET /api/v1/provider/models`（带 token）看这模型是否已存在。已 active → **警告**：重新提交会删旧端点、打回 pending、期间掉线；要改配置应走 **B（管理模型）**而非重提交。
+2. 按 `references/onboard-api.md` 的 `providerModelRequest` 拼请求体：完整 `upstream_url` + `path_prefix=__raw__` + `auth_type` + `model_vendor_slug` + 定价（CNY）；图片再带 `upstream_edit_url`/`upstream_edit_model`。
+3. **请求体给供应商确认后** POST：
    ```bash
    curl -sS -X POST https://api.aicoming.top/api/v1/provider/models \
      -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
      -d '<providerModelRequest JSON>'
    ```
-7. 记录返回（成功/失败原因），失败按实际响应调字段重试，不硬套。然后进入下一个模型。
+4. 端点落 `status=pending`，需管理员审核才上线。记录返回，失败按实际响应调字段。
 
-### 步骤 6 — 收尾
-汇总：哪些已注册（pending，归属其商家）、哪些跳过及原因、需补测/人工的项。明确告诉供应商：
-- **下一步等管理员审核，通过才上架。**
-- **以后改价/改配置**：不会自动同步（价格无可读数据源）。要改时在控制台、或重跑本 skill 走「变更请求」(`POST /api/v1/provider/change-requests`，type=edit)，管理员审核通过后生效。
+---
+
+## B. 管理模型
+
+### B1. 列出供应商的模型，让他选
+```bash
+curl -sS https://api.aicoming.top/api/v1/provider/models -H "Authorization: Bearer <TOKEN>"
+```
+把 `data.items[]` 用中文列出：模型名 / 类型 / **状态**（active 上架中、pending 审核中、disabled/suspended 已下架、rejected 已拒绝）/ 现价 / 端点 id。问供应商：**改哪一个、做什么操作？**（改价改配置 / 下架 / 重新上架 / 删除）
+
+### B2. 按操作走对应接口（注意状态机）
+
+**① 改价 / 改配置**
+- **active（已上架）端点 → 走变更请求**（不掉线、审核后生效）：
+  ```bash
+  curl -sS -X POST https://api.aicoming.top/api/v1/provider/change-requests \
+    -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+    -d '{"endpoint_id":<ID>,"type":"edit","payload":"<改动字段的JSON字符串>"}'
+  ```
+  payload 支持改：各价格、`upstream_input_cost/output_cost/cache_cost`、`upstream_model/upstream_url/path_prefix/auth_type`、`api_key`。**不支持** `upstream_edit_url/upstream_edit_model/image_resolution/billing_type`（这些要管理员直接改）。同一端点同 type 已有 pending 会被拒，先撤回（`DELETE /provider/change-requests/:id`）。
+- **pending / 草稿（尚未上线）端点 → 直接改**（`PUT`，无需再审）：
+  ```bash
+  curl -sS -X PUT https://api.aicoming.top/api/v1/provider/models/<ID> \
+    -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+    -d '<只含要改字段的 providerModelRequest JSON>'
+  ```
+- 改价同样遵守 A3 的单位/币种规则，美元先折人民币。
+
+**② 下架**（从商城和路由隐藏，不再接流量）：
+```bash
+curl -sS -X PUT https://api.aicoming.top/api/v1/provider/models/<ID> \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" -d '{"status":"disabled"}'
+```
+（临时降级用 `"suspended"`。）
+
+**③ 重新上架**（下架后想恢复）→ 走变更请求，审核后恢复：
+```bash
+curl -sS -X POST https://api.aicoming.top/api/v1/provider/change-requests \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"endpoint_id":<ID>,"type":"relist","payload":"{}"}'
+```
+
+**④ 删除**（彻底移除）→ **必须先下架**（status=disabled/rejected）才能删，不可逆，删前务必确认：
+```bash
+curl -sS -X DELETE https://api.aicoming.top/api/v1/provider/models/<ID> -H "Authorization: Bearer <TOKEN>"
+```
+
+### B3. 收尾
+告知结果与下一步：变更/重新上架是 **pending，等管理员审核**才生效；下架/删除立即生效。
+
+---
 
 ## 参考资料
 
-- `references/aicoming-contract.md` —— 接入契约、5 条适配点、图片/edit 规则、兼容判定速查。
-- `references/onboard-api.md` —— 登录、注册、变更接口的真实字段、鉴权、状态流、完整 URL 约定。
-- `scripts/probe_upstream.py` —— 全量发现 + 逐模型探测（文生图+图生图）+ 自动判 base是否补/v1、认证方式、厂商slug，输出每模型 verdict + 完整 URL 注册建议。
-- `scripts/fetch_pricing.py` —— 尽力从中转 `/api/pricing` 抓「上游成本」建议（new-api/one-api 格式，折人民币）；抓不到则回退手填。
-- `scripts/usd_to_cny.py` —— 美元定价按汇率折算成人民币（4 位小数）。
+- `references/onboard-api.md` —— 登录、提交、变更、下架/删除接口的真实字段、鉴权、状态机、完整 URL 约定。
+- `references/aicoming-contract.md` —— 接入契约、5 条适配点、图片/edit 规则、兼容判定（仅探测时需要）。
+- `scripts/probe_upstream.py` —— 可选：探测上游、判兼容、给完整 URL 注册建议（含并发与图片实测）。
+- `scripts/fetch_pricing.py` —— 可选：从中转 `/api/pricing` 抓上游成本建议（new-api 格式，折人民币）。
+- `scripts/usd_to_cny.py` —— 美元定价按汇率折人民币。

@@ -72,14 +72,25 @@
 - `POST /api/v1/provider/drafts` `{name, form_data}`（form_data 为表单 JSON 字符串）
 - `GET /api/v1/provider/drafts` / `PUT /api/v1/provider/drafts/:id` / `DELETE /api/v1/provider/drafts/:id`
 
-## 变更已上架端点（改价/改配置）
+## 管理已有端点（改价/改配置/下架/重新上架/删除）
 
-`POST /api/v1/provider/change-requests` `{endpoint_id, type, payload}`
-- `type`：`edit`（改字段，payload 是要改的字段 JSON）或 `relist`（重新上架）
-- 管理员审 `POST /api/v1/admin/change-requests/:id/approve` 后生效
-- ⚠️ 变更映射目前支持：各价格、upstream costs、`upstream_model/upstream_url/path_prefix/auth_type`、`api_key`。**不支持** `upstream_edit_url/edit_model/image_resolution/billing_type`（这些改动需管理员直接处理）。
+按端点 `status` 选接口（这是前端控制台实际走的约定）：
+
+| 操作 | 接口 | 适用状态 | 是否需审核 |
+|------|------|----------|------------|
+| 改价/改配置 | `POST /api/v1/provider/change-requests` `{endpoint_id,type:"edit",payload}` | **active** | 是，不掉线，审核后生效 |
+| 改价/改配置 | `PUT /api/v1/provider/models/:id`（body 为只含要改字段的 `providerModelRequest`） | pending / 草稿（未上线） | 否，直接改 |
+| 下架 | `PUT /api/v1/provider/models/:id` `{"status":"disabled"}`（临时降级用 `"suspended"`） | active | 否，立即隐藏，停止路由 |
+| 重新上架 | `POST /api/v1/provider/change-requests` `{endpoint_id,type:"relist",payload:"{}"}` | disabled/suspended | 是，审核后恢复 |
+| 删除 | `DELETE /api/v1/provider/models/:id` | **仅** disabled / rejected | 否，不可逆 |
+
+- `change-requests` 的 `payload` 是**改动字段的 JSON 字符串**。`type` 只能是 `edit` 或 `relist`。管理员 `POST /api/v1/admin/change-requests/:id/approve` 后生效。
+- 同一 endpoint + 同一 type 已有 `pending` 变更时再提会被拒（"已有相同的待审批请求"）；先 `DELETE /api/v1/provider/change-requests/:id` 撤回（加 `?hard=1` 硬删非 pending 记录）。
+- ⚠️ change-request `edit` 映射支持：各价格、`upstream_input_cost/output_cost/cache_cost`、`upstream_model/upstream_url/path_prefix/auth_type`、`api_key`。**不支持** `upstream_edit_url/upstream_edit_model/image_resolution/billing_type`（需管理员直接处理）。
+- ⚠️ `DELETE` 仅允许 `status` 已是 `disabled` 或 `rejected`；active 端点会返回"只能删除已下架或已拒绝的模型，请先下架再删除"。删除会连带清理无其它端点引用的孤立 catalog 模型——不可逆。
+- 查变更历史：`GET /api/v1/provider/change-requests`。
 
 ## 上架后的状态/探活
 
-- 端点 `status`：`pending` → 管理员 approve → `active`
+- 端点 `status`：`pending` → 管理员 approve → `active`；`active` --下架--> `disabled`；`disabled` --relist 审核--> `active`。
 - 平台会定期探活；连续失败会把 `route_eligible` 置 0（暂停路由），恢复后自动回归。
