@@ -44,19 +44,28 @@ curl -sS https://api.aicoming.top/api/v1/provider/dashboard -H "Authorization: B
 ### A2. 一条命令出完整计划表
 跑探测+抓价（**不传 --model 即全量发现**）：
 ```bash
-python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --pricing [--pricing-token <系统访问令牌>] [--markup 0.2] [--rate 7.2]
+python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --pricing [--pricing-token <系统访问令牌>] [--pricing-url <价目URL>] [--markup 0.2] [--rate 7.2]
 ```
-- `--markup 0.2` = 在抓到的成本上加价 20% 自动算**建议售价**（供应商确认/调整即可）。先问供应商想用多少加价率再带上；不确定可先不带，拿到成本再问。
-- 输出每个模型：`model_type`、`assessment.verdict`、`register_hint`（**完整 URL** + `__raw__` + `auth_type` + 自动分辨的 `model_vendor_slug` + 抓到的 `upstream_input_cost/output_cost` + `suggested_input_price/output_price`）。`pricing` 段说明成本来源/是否需令牌；`auth_type` 也自动探出，供应商不用手填。
+- **抓价兼容多家中转**，自动按这个顺序合并三种价格来源（`pricing.sources` 会列出命中了哪些）：
+  1. **价格内联在 `/v1/models`**（OpenRouter、LiteLLM、自建网关）——免令牌，抓 models 时白捡，覆盖面最广。
+  2. **new-api/one-api 的 `/api/pricing`**（比率制）——公开部署直接抓；需令牌的（如 ccapi）带 `--pricing-token`（中转「系统访问令牌」，非 sk- key）。自动同时试 API 域名和根域名。
+  3. **供应商给的单个价目 URL**——带 `--pricing-url`，自动判形态。
+- `--markup 0.2` = 在抓到的成本上加价 20% 自动算**建议售价**。先问供应商想用多少加价率再带上；不确定可先不带，拿到成本再问。
+- 输出每个模型：`model_type`、`assessment.verdict`、`register_hint`（**完整 URL** + `__raw__` + `auth_type` + 自动分辨的 `model_vendor_slug` + 抓到的 `upstream_input_cost/output_cost` + `suggested_input_price/output_price` + `pricing_basis`）。`auth_type` 也自动探出，供应商不用手填。
 - 图片模型要实测 gen+edit 加 `--image`（**真实生图、产生费用**，先征得同意）；判 compatible 需文生图+图生图都过。判定与契约见 `references/aicoming-contract.md`。
 - 没有 /models 接口（脚本 `note` 提示）→ 让供应商**直接报模型清单**，再 `--model <名>` 逐个探，**不要爬网站**。
 
 ### A3. 把计划表讲给供应商，敲定价格
 逐模型用中文列出：✅compatible / ⚠️needs_attention / ❌unusable（按实测，不看名字），加每个的**成本 + 建议售价**。
 - **抓到成本** → 给出建议售价（成本×(1+加价)），让供应商确认或改加价率。
-- **没抓到成本**（令牌没给/非 new-api/被 Cloudflare 拦）→ 这几个模型手报：成本 + 售价。
+- **成本没抓到时的兜底阶梯**（`pricing_basis=需手填` 的模型，**逐级往下试，都是要真实数据、不猜价**）：
+  1. 让供应商提供中转的**「系统访问令牌」**→ 重跑加 `--pricing-token`（多数 new-api 这步就拿到了）。
+  2. 让供应商给一个**价目接口/页面 URL**（他中转控制台的定价接口）→ 重跑加 `--pricing-url`。
+  3. 让供应商**直接粘贴中转控制台的价目**（截图/表格/JSON）→ 你按单位换算后填入。
+  4. 都没有 → 供应商**口头报上游成本**（他买的进价，他最清楚）。
+  5. 实在给不出 → **不猜价**：存草稿（`POST /provider/drafts`）留住已探配置，或跳过该模型，收尾标「待补价」。
 - **单位/币种讲清**（否则差千倍）：token 类 **¥/百万 token**、image **¥/张**、按次 **¥/次**，**默认人民币**；上游报价是美元就 `python scripts/usd_to_cny.py --rate <汇率> '<USD价格JSON>'` 折算，折算前后给供应商对照确认。
-- **售价/加价是供应商的决定**，必须他点头；缺价**绝不**填 0 或猜（后端会回退默认价、算错账），给不出就存草稿（`POST /provider/drafts`）或跳过。
+- **售价/加价是供应商的决定**，必须他点头；缺价**绝不**填 0 或猜（后端会回退默认价、算错账）。
 - `model_vendor_slug` 已自动分辨（`vendor_basis` 说明依据），优先复用平台已有同名模型的 slug；**仅当为空**才问供应商属于哪家（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。
 
 ### A4. 查重 → 确认 → 提交（逐模型）
@@ -127,5 +136,5 @@ curl -sS -X DELETE https://api.aicoming.top/api/v1/provider/models/<ID> -H "Auth
 - `references/onboard-api.md` —— 登录、提交、变更、下架/删除接口的真实字段、鉴权、状态机、完整 URL 约定。
 - `references/aicoming-contract.md` —— 接入契约、5 条适配点、图片/edit 规则、兼容判定（仅探测时需要）。
 - `scripts/probe_upstream.py` —— 提交主力：全量发现模型 + 判兼容 + 自动分辨厂商 + 完整 URL 注册建议；加 `--pricing [--pricing-token] [--markup]` 一并抓上游成本并算建议售价（含并发与图片实测）。
-- `scripts/fetch_pricing.py` —— 抓中转 `/api/pricing` 上游成本（new-api 格式，折人民币）：自动猜 API/根域名、支持系统访问令牌；被 probe 复用，也可单独跑。
+- `scripts/fetch_pricing.py` —— 多平台抓上游成本（折人民币）：认 ① /v1/models 内联价(OpenRouter/LiteLLM)、② new-api/one-api `/api/pricing`(比率,支持系统访问令牌、自动猜 API/根域名)、③ 供应商给的单个价目 URL(`--url`)；被 probe 复用，也可单独跑。
 - `scripts/usd_to_cny.py` —— 美元定价按汇率折人民币。

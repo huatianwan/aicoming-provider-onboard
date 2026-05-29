@@ -21,12 +21,13 @@ import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
-# 复用同目录的价格抓取（new-api /api/pricing → 上游成本）。
+# 复用同目录的价格抓取（多家中转：内联 /models 价、new-api /api/pricing、供应商给的 URL）。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from fetch_pricing import fetch_pricing_map
+    from fetch_pricing import (fetch_pricing_map, fetch_pricing_from_url,
+                               normalize_model_obj_pricing)
 except Exception:  # 脚本被单独拷走时不致崩
-    fetch_pricing_map = None
+    fetch_pricing_map = fetch_pricing_from_url = normalize_model_obj_pricing = None
 
 
 # 检测到的认证方式，被所有请求复用（main 里先 detect_auth 设定）。
@@ -91,10 +92,10 @@ def resolve_base_auth(base, key):
     return base, "bearer", "未能确认 base/auth，默认（需向供应商确认完整端点与认证方式）", False
 
 
-def discover_models(base, key):
+def discover_models(base, key, rate=7.2):
     status, raw = _req(f"{base}/models", key)
     out = {"status": status, "ok": status == 200, "models": [],
-           "supported_types": {}, "owned_by": {}, "raw_head": raw[:200]}
+           "supported_types": {}, "owned_by": {}, "inline_pricing": {}, "raw_head": raw[:200]}
     if status == 200:
         try:
             data = json.loads(raw)
@@ -106,6 +107,11 @@ def discover_models(base, key):
                         out["supported_types"][m["id"]] = m["supported_endpoint_types"]
                     if m.get("owned_by"):
                         out["owned_by"][m["id"]] = m["owned_by"]  # /models 自带的厂商线索
+                    # 价格内联在 models 里（OpenRouter/LiteLLM 等）→ 免令牌直接拿成本
+                    if normalize_model_obj_pricing:
+                        row = normalize_model_obj_pricing(m, rate)
+                        if row:
+                            out["inline_pricing"][m["id"]] = row
         except Exception:
             out["ok"] = False
     return out
@@ -426,7 +432,7 @@ def attach_pricing(results, pmap, markup):
         if not cost:
             h["pricing_basis"] = "未抓到该模型成本，请向供应商手填"
             continue
-        h["pricing_basis"] = "来自中转 /api/pricing"
+        h["pricing_basis"] = "来自自动抓取"
         ic, oc = cost.get("upstream_input_cost"), cost.get("upstream_output_cost")
         cc = cost.get("call_cost_cny")
         if ic is not None:  # token 计费
@@ -479,6 +485,7 @@ def main():
     ap.add_argument("--concurrency", type=int, default=5, help="并发探测的模型数（默认5；上游限流严就调小到1-2）")
     ap.add_argument("--pricing", action="store_true", help="同时抓上游成本（中转 /api/pricing），并进每个模型的注册建议")
     ap.add_argument("--pricing-token", default="", help="中转「系统访问令牌」（非 sk- key）；公开 pricing 可不填")
+    ap.add_argument("--pricing-url", default="", help="兜底：供应商给的单个价目 URL（价格页接口/models 接口），自动判形态")
     ap.add_argument("--markup", type=float, help="加价率，如 0.2=加价20%%；给了就按成本自动算建议售价")
     ap.add_argument("--rate", type=float, default=7.2, help="USD->CNY 汇率（中转价基本按美元，默认7.2）")
     args = ap.parse_args()
@@ -488,7 +495,7 @@ def main():
     base, auth, basis, _ = resolve_base_auth(raw_base, args.key)
     _AUTH[0] = auth
 
-    disc = discover_models(base, args.key)
+    disc = discover_models(base, args.key, args.rate)
     report = {"input_base": raw_base, "effective_base": base,
               "auth_type": {"detected": auth, "basis": basis},
               "models": disc, "results": []}
@@ -513,14 +520,34 @@ def main():
         with ThreadPoolExecutor(max_workers=workers) as ex:
             report["results"] = list(ex.map(_probe, targets))
 
-    # 抓上游成本并算建议售价（一次抓取，并进所有模型）
+    # 抓上游成本并算建议售价：多源合并（① 内联 /models 价 → ② new-api /api/pricing → ③ 供应商给的 URL）
     if args.pricing:
         if fetch_pricing_map is None:
             report["pricing"] = {"source": None, "note": "fetch_pricing 模块不可用（脚本被单独拷走？）"}
         else:
-            pmap, meta = fetch_pricing_map(raw_base, args.pricing_token, args.rate)
+            pmap = {}
+            sources = []
+            # ① 内联在 models 里的价格（OpenRouter/LiteLLM 等，免令牌）
+            inline = disc.get("inline_pricing", {})
+            if inline:
+                pmap.update(inline)
+                sources.append(f"内联/models({len(inline)})")
+            # ② new-api /api/pricing（比率制，可能需令牌）—— 覆盖内联
+            np, meta = fetch_pricing_map(raw_base, args.pricing_token, args.rate)
+            if np:
+                pmap.update(np)
+                sources.append(f"/api/pricing({len(np)})")
+            note = meta.get("note", "")
+            # ③ 供应商给的单个价目 URL —— 最高优先级覆盖
+            if args.pricing_url:
+                up, m3 = fetch_pricing_from_url(args.pricing_url, args.pricing_token, args.rate)
+                if up:
+                    pmap.update(up)
+                    sources.append(f"URL({len(up)})")
+                if m3.get("note"):
+                    note = (note + " | " if note else "") + m3["note"]
             attach_pricing(report["results"], pmap, args.markup)
-            report["pricing"] = {"source": meta.get("source"), "note": meta.get("note", ""),
+            report["pricing"] = {"sources": sources or ["（无）"], "note": note,
                                  "matched": sum(1 for r in report["results"]
                                                 if r["register_hint"].get("pricing_basis", "").startswith("来自")),
                                  "rate": args.rate, "markup": args.markup}
