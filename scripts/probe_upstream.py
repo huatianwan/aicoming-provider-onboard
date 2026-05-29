@@ -18,6 +18,7 @@ import json
 import sys
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 
 # 检测到的认证方式，被所有请求复用（main 里先 detect_auth 设定）。
@@ -65,9 +66,10 @@ def resolve_base_auth(base, key):
     if not base.lower().endswith("/v1"):
         bases.append(base + "/v1")
     # 优先用 /models（不花钱）：哪个 base×auth 组合 200，就定了 base 和 auth。
+    # 短超时(15s)：检测阶段死端点快速失败，不要 60s 干等。
     for b in bases:
         for a in ("bearer", "header", "query"):
-            st, _ = _req(f"{b}/models", key, auth=a)
+            st, _ = _req(f"{b}/models", key, auth=a, timeout=15)
             if st == 200:
                 return b, a, f"/models 200 @ {b} via {a}", True
     # /models 不可用 → 用极小 chat ping 探（非 401/403/404 视为该 base+auth 通）。
@@ -75,7 +77,7 @@ def resolve_base_auth(base, key):
         for a in ("bearer", "header", "query"):
             st, _ = _req(f"{b}/chat/completions", key, "POST",
                          {"model": "probe", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
-                         auth=a)
+                         auth=a, timeout=15)
             if st not in (401, 403, 404, 0):
                 return b, a, f"chat {st} @ {b} via {a}（非401/403/404视为通）", False
     return base, "bearer", "未能确认 base/auth，默认（需向供应商确认完整端点与认证方式）", False
@@ -116,7 +118,7 @@ def classify_model(name, supported_types=None):
 
 def probe_embeddings(base, key, model):
     body = {"model": model, "input": "hello"}
-    status, raw = _req(f"{base}/embeddings", key, "POST", body)
+    status, raw = _req(f"{base}/embeddings", key, "POST", body, timeout=25)
     r = {"status": status, "ok": status == 200, "has_embedding": False, "raw_head": raw[:200]}
     if status == 200:
         try:
@@ -129,7 +131,8 @@ def probe_embeddings(base, key, model):
 def probe_chat_nonstream(base, key, model):
     def call(field):
         return _req(f"{base}/chat/completions", key, "POST",
-                    {"model": model, "messages": [{"role": "user", "content": "ping"}], field: 16})
+                    {"model": model, "messages": [{"role": "user", "content": "ping"}], field: 16},
+                    timeout=30)
     tokens_field = "max_tokens"
     status, raw = call(tokens_field)
     # 推理模型(o1/o3 类)拒绝 max_tokens、要 max_completion_tokens → 回退重试
@@ -154,7 +157,7 @@ def probe_chat_stream(base, key, model, tokens_field="max_tokens"):
             "stream": True, tokens_field: 20}
     r = {"ok": False, "got_sse": False, "saw_done": False,
          "usage_in_stream": False, "status": 0, "note": ""}
-    status, resp = _req(f"{base}/chat/completions", key, "POST", body, stream=True)
+    status, resp = _req(f"{base}/chat/completions", key, "POST", body, stream=True, timeout=30)
     r["status"] = status
     if status != 200 or isinstance(resp, str):
         r["note"] = resp[:200] if isinstance(resp, str) else f"status {status}"
@@ -411,8 +414,12 @@ def probe_one(base, key, model, mtype, do_image, auth="bearer", owned_by=""):
         r["chat_stream"] = probe_chat_stream(base, key, model, ns.get("tokens_field", "max_tokens"))
     elif mtype == "image":
         if do_image:
-            r["image_gen"] = probe_image_gen(base, key, model)
-            r["image_edit"] = probe_image_edit(base, key, model, "image")
+            # 文生图 + 图生图并行（两个独立端点，省一半等待）
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fg = ex.submit(probe_image_gen, base, key, model)
+                fe = ex.submit(probe_image_edit, base, key, model, "image")
+                r["image_gen"] = fg.result()
+                r["image_edit"] = fe.result()
             if not r["image_edit"]["ok"]:
                 r["image_edit_alt"] = probe_image_edit(base, key, model, "image[]")
         else:
@@ -432,6 +439,7 @@ def main():
     ap.add_argument("--key", required=True, help="上游 API key")
     ap.add_argument("--model", help="只探测这一个模型；不传则探测 /models 发现的**全部**模型")
     ap.add_argument("--image", action="store_true", help="探测图片模型（文生图+图生图，会产生真实费用）")
+    ap.add_argument("--concurrency", type=int, default=5, help="并发探测的模型数（默认5；上游限流严就调小到1-2）")
     args = ap.parse_args()
     raw_base = args.base.rstrip("/")
 
@@ -451,10 +459,18 @@ def main():
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 
-    for m in targets:
+    def _probe(m):
         mtype = classify_model(m, disc.get("supported_types", {}).get(m))
         owned_by = disc.get("owned_by", {}).get(m, "")
-        report["results"].append(probe_one(base, args.key, m, mtype, args.image, auth, owned_by))
+        return probe_one(base, args.key, m, mtype, args.image, auth, owned_by)
+
+    # 并发探测多个模型（默认5路），保持输出顺序与 targets 一致。
+    workers = max(1, min(args.concurrency, len(targets)))
+    if workers == 1:
+        report["results"] = [_probe(m) for m in targets]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            report["results"] = list(ex.map(_probe, targets))
 
     # 汇总
     report["summary"] = {
