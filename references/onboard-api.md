@@ -1,0 +1,85 @@
+# AIComing 供应商上架 API 参考
+
+> 这些接口字段来自后端真实代码（`internal/handler/auth/provider_ops.go`）。
+> 调用前以线上实际响应为准；字段或路由若对不上，按实际返回调整，不要硬套。
+
+## 基础
+
+- API Base：`https://api.aicoming.top`
+
+### 登录换 token（第一步）
+`POST /api/v1/auth/login`，请求体 `{"username":"<账号>","password":"<密码>"}`，返回 `{"token":"<JWT>"}`。
+- 若该账号是供应商，登录会自动签发**带供应商能力的 token**。
+- 之后所有注册都用这个 token → **模型自动归属到这个账号对应的商家名下**（后端按 token 身份 `currentProvider` 关联，无需手动指定商家）。
+- 密码**仅用于这一步换取 token**，不存储、不打印。
+- 前置条件：账号必须**已是审核通过的供应商**。登录响应含 `has_provider` 布尔值：
+  - `false` → 账号还不是供应商。**引导去申请，不要继续上架**：申请页 `https://aicoming.top/merchant-apply.html`（提交商家资料+证件，管理员审核通过后才成为供应商）。申请接口是 `POST /api/v1/merchants/apply`，但涉及证件/头像文件上传，应让供应商在网页完成，skill 不代办。
+  - 注册接口 `POST /api/v1/provider/models` 对非供应商会返回 `404 provider profile required`。
+
+### 完整 URL 约定（重要）
+注册每个模型时，**提交完整的端点 URL + `path_prefix="__raw__"`**，让平台原样使用、不再拼接：
+- 对话：`upstream_url = {base}/chat/completions`
+- 图片：`upstream_url = {base}/images/generations`，`upstream_edit_url = {base}/images/edits`
+- 嵌入：`upstream_url = {base}/embeddings`
+
+探测脚本的 `register_hint` 已按此生成，直接用即可。
+
+## 注册一个模型端点
+
+`POST /api/v1/provider/models`
+
+请求体字段（`providerModelRequest`，全部可填，未填用默认）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | string | 平台模型展示名 |
+| `slug` | string | 模型标识 |
+| `model_vendor_slug` 或 `model_vendor_id` | string/uint | **模型厂商，必填**（只给 `model_vendor_name` 会 400）。常用 slug：`openai` `anthropic` `google` `deepseek` `qwen` `zhipu-ai` `xai` `midjourney` 等 |
+| `type` | string | 模型类型（chat/image/embedding 等） |
+| `category` | string | 分类 |
+| `upstream_url` | string | 你的上游 Base URL |
+| `upstream_edit_url` | string | 图生图（/images/edits）的完整 URL；留空则平台按 `generations→edits` 自动推导 |
+| `upstream_model` | string | 你上游的真实模型名（留空=用平台模型名） |
+| `upstream_edit_model` | string | 图生图使用的模型名；留空则回退用 `upstream_model` |
+| `path_prefix` | string | 路径前缀，默认 `/v1`；填 `__raw__` 表示 upstream_url 是完整地址 |
+| `auth_type` | string | `bearer`(默认) / `header`(x-api-key) / `query`(?key=) |
+| `api_key` | string | 你的上游 key（后端加密存储） |
+| `billing_type` | string | `token` / `image` / `call` |
+| `image_price` / `call_price` | float | 图片单价 / 按次单价 |
+| `input_price` / `output_price` / `cache_price` | float | 用户价（¥/1M token） |
+| `cache_create_5m_price` / `cache_create_1h_price` | float | 缓存写入价 |
+| `upstream_input_cost` / `upstream_output_cost` / `upstream_cache_cost` | float | 你的上游成本（用于结算毛利，不对用户展示） |
+| `image_resolution` | string | 图片端点支持的最大分辨率，如 `1024x1024` |
+| `probe_result` / `probe_error_code` / `probe_message` / `probe_latency_ms` / `probe_status_code` | — | 探测结果（可由 probe 脚本填入） |
+| `note` | string | 备注 |
+
+**行为**：创建后端点 `status="pending"`，`protocol` 由 `upstream_url`+`path_prefix` 自动推导，`currency="CNY"`。**需管理员审核后才 `active` 上架。**
+
+> ⚠️ **重复注册有破坏性**：对"同 provider + 同 model"再次调用本接口，后端会**先删除该 provider 现有的同模型端点、再建新的（pending）**。若该模型已 `active` 上线，重注册会让它**掉线、打回待审**。所以注册前应 `GET /api/v1/provider/models` 查重；要改已上线端点的配置/价格，走「变更请求」(`/provider/change-requests`)，不要重注册。
+
+> 价格单位：`input/output/cache_price` 与 `upstream_*_cost` 均为 **¥/1M token**；`image_price` 为 **¥/张**；`call_price` 为 **¥/次**。美元报价先用 `usd_to_cny.py` 折算。
+
+## 图片编辑端点（图生图）
+
+提交接口已支持 `upstream_edit_url` / `upstream_edit_model`，可直接填：
+- 探测确认了上游 `/images/edits` 的真实地址后，把它填进 `upstream_edit_url`（探到的 edit model 填 `upstream_edit_model`）。
+- 留空时平台回退到推导：`path_prefix=__raw__` 且 `upstream_url` 指向 `.../v1/images/generations` → 自动换成 `edits`（适用于同级上游，如 ccapi）。
+
+> 注：此能力依赖后端已部署对应版本（提交接口 + change-request 已加这两个字段并贯通到 relay）。若线上尚未部署该版本，填了也会被忽略，仍走推导/管理员补。
+
+## 草稿（可选）
+
+- `POST /api/v1/provider/drafts` `{name, form_data}`（form_data 为表单 JSON 字符串）
+- `GET /api/v1/provider/drafts` / `PUT /api/v1/provider/drafts/:id` / `DELETE /api/v1/provider/drafts/:id`
+
+## 变更已上架端点（改价/改配置）
+
+`POST /api/v1/provider/change-requests` `{endpoint_id, type, payload}`
+- `type`：`edit`（改字段，payload 是要改的字段 JSON）或 `relist`（重新上架）
+- 管理员审 `POST /api/v1/admin/change-requests/:id/approve` 后生效
+- ⚠️ 变更映射目前支持：各价格、upstream costs、`upstream_model/upstream_url/path_prefix/auth_type`、`api_key`。**不支持** `upstream_edit_url/edit_model/image_resolution/billing_type`（这些改动需管理员直接处理）。
+
+## 上架后的状态/探活
+
+- 端点 `status`：`pending` → 管理员 approve → `active`
+- 平台会定期探活；连续失败会把 `route_eligible` 置 0（暂停路由），恢复后自动回归。
