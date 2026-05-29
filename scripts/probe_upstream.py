@@ -84,7 +84,7 @@ def resolve_base_auth(base, key):
 def discover_models(base, key):
     status, raw = _req(f"{base}/models", key)
     out = {"status": status, "ok": status == 200, "models": [],
-           "supported_types": {}, "raw_head": raw[:200]}
+           "supported_types": {}, "owned_by": {}, "raw_head": raw[:200]}
     if status == 200:
         try:
             data = json.loads(raw)
@@ -94,6 +94,8 @@ def discover_models(base, key):
                     out["models"].append(m["id"])
                     if m.get("supported_endpoint_types"):
                         out["supported_types"][m["id"]] = m["supported_endpoint_types"]
+                    if m.get("owned_by"):
+                        out["owned_by"][m["id"]] = m["owned_by"]  # /models 自带的厂商线索
         except Exception:
             out["ok"] = False
     return out
@@ -328,32 +330,63 @@ def assess(report):
     return {"model_type": mtype, "verdict": verdict, "issues": issues}
 
 
-def guess_vendor_slug(model):
-    """按模型名猜平台 model_vendor_slug（注册必填，留空则需向供应商确认）。"""
-    n = (model or "").lower()
+# 平台已知厂商 slug（model_vendors 表）。
+_VENDOR_SLUGS = ("openai", "anthropic", "google", "deepseek", "qwen", "zhipu-ai",
+                 "xai", "midjourney", "minimax", "baidu-qianfan", "alibaba-bailian",
+                 "iflytek-spark", "tencent-hunyuan", "ollama", "kling-ai")
+
+
+def _vendor_from_name(n):
     if "claude" in n or "anthropic" in n:
         return "anthropic"
-    if "gemini" in n or n.startswith("google"):
+    if "gemini" in n or "imagen" in n or n.startswith("google"):
         return "google"
     if "deepseek" in n:
         return "deepseek"
-    if "qwen" in n or "tongyi" in n:
+    if "qwen" in n or "tongyi" in n or "通义" in n:
         return "qwen"
-    if "glm" in n or "zhipu" in n:
+    if "glm" in n or "zhipu" in n or "智谱" in n:
         return "zhipu-ai"
     if "grok" in n or "xai" in n:
         return "xai"
-    if "midjourney" in n:
+    if "midjourney" in n or n.startswith("mj-"):
         return "midjourney"
-    if any(k in n for k in ("gpt", "o1", "o3", "o4", "dall", "openai", "image", "whisper", "tts")):
+    if "minimax" in n or "abab" in n:
+        return "minimax"
+    if "ernie" in n or "wenxin" in n or "文心" in n or "qianfan" in n:
+        return "baidu-qianfan"
+    if "hunyuan" in n or "混元" in n:
+        return "tencent-hunyuan"
+    if "spark" in n or "星火" in n:
+        return "iflytek-spark"
+    if "kling" in n or "可灵" in n:
+        return "kling-ai"
+    if any(k in n for k in ("gpt", "o1-", "o3", "o4", "dall", "openai", "whisper",
+                            "tts", "text-embedding", "codex", "image")):
         return "openai"
-    return ""  # 猜不出 → skill 向供应商确认
+    return ""
 
 
-def register_hint(base, model, mtype, auth="bearer"):
+def resolve_vendor_slug(model, owned_by=""):
+    """多信号自动分辨平台 model_vendor_slug，返回 (slug, 依据)。
+    名字优先（中转常把 owned_by 一律设成 openai，名字更可靠）；owned_by 兜底。"""
+    byname = _vendor_from_name((model or "").lower())
+    if byname:
+        return byname, "按模型名"
+    ob = (owned_by or "").lower().strip()
+    if ob:
+        for s in _VENDOR_SLUGS:
+            head = s.split("-")[0]
+            if ob == s or ob == s.replace("-", "") or (len(head) > 3 and head in ob):
+                return s, f"owned_by={owned_by}"
+    return "", "无法自动分辨，需向供应商确认"
+
+
+def register_hint(base, model, mtype, auth="bearer", owned_by=""):
     """每个模型的注册建议：提交**完整 URL** + path_prefix=__raw__，不靠平台拼接。"""
+    vslug, vbasis = resolve_vendor_slug(model, owned_by)
     h = {"upstream_model": model, "path_prefix": "__raw__",
-         "auth_type": auth, "model_vendor_slug": guess_vendor_slug(model)}
+         "auth_type": auth, "model_vendor_slug": vslug, "vendor_basis": vbasis}
     if mtype == "chat":
         h["upstream_url"] = base + "/chat/completions"
         h["billing_type"] = "token"
@@ -370,7 +403,7 @@ def register_hint(base, model, mtype, auth="bearer"):
     return h
 
 
-def probe_one(base, key, model, mtype, do_image, auth="bearer"):
+def probe_one(base, key, model, mtype, do_image, auth="bearer", owned_by=""):
     r = {"model": model, "model_type": mtype, "models": {"ok": True}}
     if mtype == "chat":
         ns = probe_chat_nonstream(base, key, model)
@@ -389,7 +422,7 @@ def probe_one(base, key, model, mtype, do_image, auth="bearer"):
         r["embeddings"] = probe_embeddings(base, key, model)
     # audio/rerank: 留待人工
     r["assessment"] = assess(r)
-    r["register_hint"] = register_hint(base, model, mtype, auth)
+    r["register_hint"] = register_hint(base, model, mtype, auth, owned_by)
     return r
 
 
@@ -420,7 +453,8 @@ def main():
 
     for m in targets:
         mtype = classify_model(m, disc.get("supported_types", {}).get(m))
-        report["results"].append(probe_one(base, args.key, m, mtype, args.image, auth))
+        owned_by = disc.get("owned_by", {}).get(m, "")
+        report["results"].append(probe_one(base, args.key, m, mtype, args.image, auth, owned_by))
 
     # 汇总
     report["summary"] = {

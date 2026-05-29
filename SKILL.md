@@ -80,20 +80,24 @@ python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --model <图片�
 ### 步骤 5 — 逐个模型上架（一次一个，别批量）
 **对每个可上架的模型，单独走一遍**，不要一次性处理全部：
 1. 报这个模型的探测结论，问：这个上架吗？—— 等回答。
-2. 问定价。**必须讲清单位**，否则容易差 1000 倍：
-   - token 类：输入价 / 输出价 / 上游成本，单位 **¥ 每百万(1M) token**。
-   - image 类：每**张**价 + 成本，单位 **¥/张**。
-   - 按次类：每**次**单价，单位 **¥/次**。
-   - **先问币种**（人民币还是美元）。
-   - **价格探测不到，只能问；定价是强制项。** 缺价时**绝不**用 0 或猜的值提交（后端会回退到平台模型默认价、成本算 0 → 算错账）。
-   - 供应商一时给不出价 → **不要注册这个模型**。二选一：① 跳过，收尾里标"待补价"；② 存草稿保留已探配置：`curl -sS -X POST https://api.aicoming.top/api/v1/provider/drafts -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" -d '{"name":"<模型>","form_data":"<已探到的配置JSON字符串>"}'`，让其拿到价再提交。
+2. 定价。**单位/币种说明**（必须讲清，否则差 1000 倍）：单位 token 类 **¥/百万(1M) token**、image **¥/张**、按次 **¥/次**；**币种默认人民币**，若来源是美元则用 `usd_to_cny.py` 折成人民币。
+   - **先尝试从中转抓"上游成本"**（省得手填成本）：
+     ```bash
+     python scripts/fetch_pricing.py --base <中转host> --rate <汇率> --model <模型>
+     ```
+     - 抓到（中转 `/api/pricing` 公开）→ 得到 `upstream_input_cost/output_cost`(已折人民币) 作为**成本建议**，给供应商确认。
+     - 返回"需登录"（如 ccapi 401）→ 让供应商从其中转控制台给个**网站登录 token**(`--token`)，或直接口头报成本。
+     - 抓不到 → 手动问成本。
+   - **售价（input_price/output_price 等）抓不到、必须问供应商**（这是他的加价决定，不是中转标价）。
+   - **定价是强制项**：缺价**绝不**用 0 或猜值提交（后端会回退平台默认价、成本算 0 → 算错账）。
+   - 供应商给不出价 → **不注册**：① 跳过，收尾标"待补价"；② 存草稿 `POST /api/v1/provider/drafts {name, form_data}` 保留已探配置，拿到价再提交。
 3. **若报价是美元**：问当日 USD→CNY 汇率（让其确认），折算：
    ```bash
    python scripts/usd_to_cny.py --rate <汇率> '<USD价格字段JSON>'
    ```
    把折算后 CNY 值用于注册，`note` 写"原始 USD，按 <汇率> 折算"。**折算前后对照给供应商确认**。
 4. 用 `register_hint`（**完整 upstream_url + path_prefix=__raw__** + `auth_type`(探测得出) + `model_vendor_slug`；图片再带 `upstream_edit_url`/`upstream_edit_model`）+ 定价 + 探测结果，拼 `providerModelRequest`（字段见 `references/onboard-api.md`）。
-   - **`model_vendor_slug` 必填**（只给 name 会 400）。register_hint 已按模型名猜了一个；**向供应商确认**，猜不出(空)就问他属于哪个厂商（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。
+   - **`model_vendor_slug` 必填**（只给 name 会 400）。register_hint 已**自动分辨**（多信号：模型名优先，owned_by 兜底；`vendor_basis` 字段说明依据）——通常直接用即可。**仅当它为空**（`vendor_basis`="无法自动分辨")才问供应商属于哪个厂商（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。
    - **slug 优先复用平台已有模型**：若平台已有同名/对应模型（如 `gpt-4o`），`slug` 用平台的，让端点挂到正确目录下；**别乱起新 slug**（会新建一个垃圾目录模型）。`name`/`type`/`category` 也尽量对齐平台已有模型。
    - `auth_type` 用探测报告里的 `auth_type.detected`（bearer/header/query）；若探测显示"未能确认"，问供应商其上游用哪种认证。
 5. **注册前先查重**：用 `GET /api/v1/provider/models`（带 token）看这个模型是否**已注册且 active**。
@@ -116,5 +120,6 @@ python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --model <图片�
 
 - `references/aicoming-contract.md` —— 接入契约、5 条适配点、图片/edit 规则、兼容判定速查。
 - `references/onboard-api.md` —— 登录、注册、变更接口的真实字段、鉴权、状态流、完整 URL 约定。
-- `scripts/probe_upstream.py` —— 全量发现 + 逐模型探测（文生图+图生图），输出每模型 verdict + 完整 URL 注册建议。
+- `scripts/probe_upstream.py` —— 全量发现 + 逐模型探测（文生图+图生图）+ 自动判 base是否补/v1、认证方式、厂商slug，输出每模型 verdict + 完整 URL 注册建议。
+- `scripts/fetch_pricing.py` —— 尽力从中转 `/api/pricing` 抓「上游成本」建议（new-api/one-api 格式，折人民币）；抓不到则回退手填。
 - `scripts/usd_to_cny.py` —— 美元定价按汇率折算成人民币（4 位小数）。
