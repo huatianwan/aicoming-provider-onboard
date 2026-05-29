@@ -347,22 +347,38 @@ def assess(report):
     return {"model_type": mtype, "verdict": verdict, "issues": issues}
 
 
-# 平台已知厂商 slug（model_vendors 表）。
+# 平台已知厂商 slug（model_vendors 表里真实可选的，owned_by 兜底匹配用）。
 _VENDOR_SLUGS = ("openai", "anthropic", "google", "deepseek", "qwen", "zhipu-ai",
                  "xai", "midjourney", "minimax", "baidu-qianfan", "alibaba-bailian",
-                 "iflytek-spark", "tencent-hunyuan", "ollama", "kling-ai")
+                 "iflytek-spark", "tencent-hunyuan", "ollama", "kling-ai",
+                 "moonshot", "stepfun", "mistral", "meta", "cohere", "perplexity",
+                 "baichuan", "nvidia", "microsoft", "yi", "volcano-engine",
+                 "openrouter", "siliconflow", "together", "groq", "fireworks")
+
+# OpenRouter / 聚合站常用 "vendor/model" 前缀 → 平台 slug（前缀是最强的厂商信号）。
+_PREFIX_SLUGS = {
+    "openai": "openai", "anthropic": "anthropic", "google": "google",
+    "deepseek": "deepseek", "qwen": "qwen", "alibaba": "qwen",
+    "x-ai": "xai", "xai": "xai", "mistralai": "mistral", "mistral": "mistral",
+    "meta-llama": "meta", "meta": "meta", "moonshotai": "moonshot", "moonshot": "moonshot",
+    "stepfun": "stepfun", "stepfun-ai": "stepfun", "cohere": "cohere",
+    "perplexity": "perplexity", "nvidia": "nvidia", "microsoft": "microsoft",
+    "z-ai": "zhipu-ai", "zhipuai": "zhipu-ai", "zhipu": "zhipu-ai", "thudm": "zhipu-ai",
+    "minimax": "minimax", "minimaxai": "minimax", "01-ai": "yi", "baichuan": "baichuan",
+    "baidu": "baidu-qianfan", "bytedance": "volcano-engine", "tencent": "tencent-hunyuan",
+}
 
 
 def _vendor_from_name(n):
     if "claude" in n or "anthropic" in n:
         return "anthropic"
-    if "gemini" in n or "imagen" in n or n.startswith("google"):
+    if "gemini" in n or "imagen" in n or "gemma" in n or n.startswith("google"):
         return "google"
     if "deepseek" in n:
         return "deepseek"
     if "qwen" in n or "tongyi" in n or "通义" in n:
         return "qwen"
-    if "glm" in n or "zhipu" in n or "智谱" in n:
+    if "glm" in n or "zhipu" in n or "智谱" in n or "chatglm" in n:
         return "zhipu-ai"
     if "grok" in n or "xai" in n:
         return "xai"
@@ -378,6 +394,22 @@ def _vendor_from_name(n):
         return "iflytek-spark"
     if "kling" in n or "可灵" in n:
         return "kling-ai"
+    if "kimi" in n or "moonshot" in n:
+        return "moonshot"
+    if "step-" in n or n.startswith("step"):
+        return "stepfun"
+    if "mistral" in n or "mixtral" in n or "codestral" in n:
+        return "mistral"
+    if "llama" in n or n.startswith("meta"):
+        return "meta"
+    if "command" in n or "cohere" in n:
+        return "cohere"
+    if "sonar" in n or "perplexity" in n:
+        return "perplexity"
+    if "baichuan" in n:
+        return "baichuan"
+    if "doubao" in n or "豆包" in n:
+        return "volcano-engine"
     if any(k in n for k in ("gpt", "o1-", "o3", "o4", "dall", "openai", "whisper",
                             "tts", "text-embedding", "codex", "image")):
         return "openai"
@@ -386,10 +418,21 @@ def _vendor_from_name(n):
 
 def resolve_vendor_slug(model, owned_by=""):
     """多信号自动分辨平台 model_vendor_slug，返回 (slug, 依据)。
-    名字优先（中转常把 owned_by 一律设成 openai，名字更可靠）；owned_by 兜底。"""
-    byname = _vendor_from_name((model or "").lower())
+    顺序：vendor/ 前缀（最强）→ 模型名 → owned_by 兜底。中转常把 owned_by 一律设成 openai，故名字/前缀优先。"""
+    m = (model or "").lower().strip()
+    # 1) "vendor/model" 前缀（OpenRouter、多数聚合站）——最可靠
+    if "/" in m:
+        prefix = m.split("/", 1)[0]
+        if prefix in _PREFIX_SLUGS:
+            return _PREFIX_SLUGS[prefix], f"按 vendor/ 前缀（{prefix}）"
+        by = _vendor_from_name(prefix)
+        if by:
+            return by, f"按 vendor/ 前缀（{prefix}）"
+    # 2) 模型名
+    byname = _vendor_from_name(m)
     if byname:
         return byname, "按模型名"
+    # 3) owned_by 兜底
     ob = (owned_by or "").lower().strip()
     if ob:
         for s in _VENDOR_SLUGS:
