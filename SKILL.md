@@ -12,9 +12,9 @@ description: 帮 API 供应商在 AIComing 供应商平台做两件事——【�
 
 ## 三条铁律
 
-1. **一步一步，一次只问一项**：问完一项停下等回答，再问下一项。绝不一次甩一堆字段。每项给一句话示例。
-2. **绝不自己填用户该提供的值**：token、base_url、key、价格……即使你能查库/解密/上下文已有，也**必须让供应商自己给**。这是引导，不是脚本批跑。
-3. **任何写操作（提交/改价/下架/删除）前，把将要提交的请求体给供应商确认再发**。账号密码只用于换 token，不存储、不打印；删除等不可逆操作尤其要确认。
+1. **能自动抓的就替供应商抓全，别让他手填**：模型清单、类型、厂商 slug、完整 URL、认证方式、上游成本——全部用脚本一次探出来。真正需要供应商给的只有：上游连接信息（base/key）、可选的中转令牌、以及他的**商业决定**（上哪些模型、加价/售价）。这些**一次问一项、等回答**，每项给一句话示例。
+2. **绝不替供应商做商业决定或替他确认该确认的值**：上哪些模型、加价率/售价**必须他定**；探到的成本只是“建议”，要他点头。token/base/key 等也由他给——即使你能查库/解密，也不自行填。账号密码只用于换 token，**不存储、不打印**。
+3. **任何写操作（提交/改价/下架/删除）前，把将要提交的请求体给供应商确认再发**。删除等不可逆操作尤其要确认。
 
 ## 通用第 0 步 —— 取 token + 校验资格
 
@@ -34,40 +34,41 @@ curl -sS https://api.aicoming.top/api/v1/provider/dashboard -H "Authorization: B
 
 ## A. 提交模型
 
-### A1. 收集这一个模型的信息（逐项问）
-1. 上游 **Base URL**？（host 或带 `/v1`/`/v2` 都行，不强求到 /v1）
+目标：供应商**只给 base + key（+ 可选中转令牌）**，脚本一次把模型、类型、厂商、完整 URL、认证、成本全抓出来，并按加价率算好建议售价；供应商只需挑模型、定加价、确认即上架。
+
+### A1. 收集连接信息（逐项问，等回答）
+1. 上游 **Base URL**？（host 或带 `/v1`/`/v2` 都行，不强求到 /v1，脚本自动判断补不补）
 2. 上游 **API key**？
-3. 这次要上的**模型名**（上游真实模型 ID）？
-4. 模型**类型**（chat / image / embedding…）？
+3.（可选）能否拿到中转的**「系统访问令牌」**用来自动抓成本价？——在其中转控制台「个人设置 → 生成系统访问令牌」复制（**不是** sk- 开头的 API key）。给了能自动带出成本；给不了就到 A3 手报成本。
 
-### A2.（可选）探测验证——拿不准是否兼容时才用
-供应商若不确定格式对不对、或想先验证能不能跑通，再用探测脚本；**他清楚自己接口的，可跳过直接填表**。
+### A2. 一条命令出完整计划表
+跑探测+抓价（**不传 --model 即全量发现**）：
 ```bash
-python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --model <模型> [--image]
+python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --pricing [--pricing-token <系统访问令牌>] [--markup 0.2] [--rate 7.2]
 ```
-- 输出 `auth_type`（认证方式）、`assessment.verdict`（compatible/needs_attention/unusable）、`register_hint`（完整 URL + `__raw__` + 建议字段）。判定与契约见 `references/aicoming-contract.md`。
-- 图片模型加 `--image` 会**真实生图、产生费用**，须先征得同意；判 compatible 需文生图+图生图都过。
-- 不传 `--model` 可探 `/models` 全量；没有 /models 接口就让供应商直接报模型清单，**不要爬网站**。
+- `--markup 0.2` = 在抓到的成本上加价 20% 自动算**建议售价**（供应商确认/调整即可）。先问供应商想用多少加价率再带上；不确定可先不带，拿到成本再问。
+- 输出每个模型：`model_type`、`assessment.verdict`、`register_hint`（**完整 URL** + `__raw__` + `auth_type` + 自动分辨的 `model_vendor_slug` + 抓到的 `upstream_input_cost/output_cost` + `suggested_input_price/output_price`）。`pricing` 段说明成本来源/是否需令牌；`auth_type` 也自动探出，供应商不用手填。
+- 图片模型要实测 gen+edit 加 `--image`（**真实生图、产生费用**，先征得同意）；判 compatible 需文生图+图生图都过。判定与契约见 `references/aicoming-contract.md`。
+- 没有 /models 接口（脚本 `note` 提示）→ 让供应商**直接报模型清单**，再 `--model <名>` 逐个探，**不要爬网站**。
 
-### A3. 定价（强制，逐项问）
-- **单位/币种讲清**（否则差千倍）：token 类 **¥/百万 token**（input/output）、image **¥/张**、按次 **¥/次**；**默认人民币**。
-- **售价必须问供应商**（他的加价决定，探不出来）。缺价**绝不**填 0 或猜——后端会回退默认价、算错账；给不出价就存草稿（`POST /provider/drafts`）或跳过。
-- 报价是美元 → 问当日汇率，`python scripts/usd_to_cny.py --rate <汇率> '<USD价格JSON>'` 折人民币，折算前后给供应商对照确认。
-- 想省手填**成本**可选试 `python scripts/fetch_pricing.py --base <中转host> --rate <汇率> --model <模型>`（new-api 公开 pricing 才抓得到，多数需登录则手填）。
+### A3. 把计划表讲给供应商，敲定价格
+逐模型用中文列出：✅compatible / ⚠️needs_attention / ❌unusable（按实测，不看名字），加每个的**成本 + 建议售价**。
+- **抓到成本** → 给出建议售价（成本×(1+加价)），让供应商确认或改加价率。
+- **没抓到成本**（令牌没给/非 new-api/被 Cloudflare 拦）→ 这几个模型手报：成本 + 售价。
+- **单位/币种讲清**（否则差千倍）：token 类 **¥/百万 token**、image **¥/张**、按次 **¥/次**，**默认人民币**；上游报价是美元就 `python scripts/usd_to_cny.py --rate <汇率> '<USD价格JSON>'` 折算，折算前后给供应商对照确认。
+- **售价/加价是供应商的决定**，必须他点头；缺价**绝不**填 0 或猜（后端会回退默认价、算错账），给不出就存草稿（`POST /provider/drafts`）或跳过。
+- `model_vendor_slug` 已自动分辨（`vendor_basis` 说明依据），优先复用平台已有同名模型的 slug；**仅当为空**才问供应商属于哪家（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。
 
-### A4. 厂商 slug（必填）
-`model_vendor_slug` 必填（只给 name 会 400）。探测的 `register_hint` 已自动分辨（`vendor_basis` 说明依据），通常直接用；**仅当为空**才问供应商属于哪家（openai/anthropic/google/deepseek/qwen/zhipu-ai/xai/midjourney…）。优先复用平台已有同名模型的 slug，别乱起新 slug。
-
-### A5. 查重 → 确认 → 提交
-1. 查重：`GET /api/v1/provider/models`（带 token）看这模型是否已存在。已 active → **警告**：重新提交会删旧端点、打回 pending、期间掉线；要改配置应走 **B（管理模型）**而非重提交。
-2. 按 `references/onboard-api.md` 的 `providerModelRequest` 拼请求体：完整 `upstream_url` + `path_prefix=__raw__` + `auth_type` + `model_vendor_slug` + 定价（CNY）；图片再带 `upstream_edit_url`/`upstream_edit_model`。
+### A4. 查重 → 确认 → 提交（逐模型）
+1. 查重：`GET /api/v1/provider/models`（带 token）。已 active → **警告**：重新提交会删旧端点、打回 pending、期间掉线；要改配置走 **B（管理模型）**而非重提交。
+2. 用 `register_hint`（完整 `upstream_url` + `path_prefix=__raw__` + `auth_type` + `model_vendor_slug` + 定价 CNY；图片带 `upstream_edit_url`/`upstream_edit_model`）拼 `providerModelRequest`（字段见 `references/onboard-api.md`）。
 3. **请求体给供应商确认后** POST：
    ```bash
    curl -sS -X POST https://api.aicoming.top/api/v1/provider/models \
      -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
      -d '<providerModelRequest JSON>'
    ```
-4. 端点落 `status=pending`，需管理员审核才上线。记录返回，失败按实际响应调字段。
+4. 端点落 `status=pending`，需管理员审核才上线。记录返回，失败按实际响应调字段，再下一个。
 
 ---
 
@@ -125,6 +126,6 @@ curl -sS -X DELETE https://api.aicoming.top/api/v1/provider/models/<ID> -H "Auth
 
 - `references/onboard-api.md` —— 登录、提交、变更、下架/删除接口的真实字段、鉴权、状态机、完整 URL 约定。
 - `references/aicoming-contract.md` —— 接入契约、5 条适配点、图片/edit 规则、兼容判定（仅探测时需要）。
-- `scripts/probe_upstream.py` —— 可选：探测上游、判兼容、给完整 URL 注册建议（含并发与图片实测）。
-- `scripts/fetch_pricing.py` —— 可选：从中转 `/api/pricing` 抓上游成本建议（new-api 格式，折人民币）。
+- `scripts/probe_upstream.py` —— 提交主力：全量发现模型 + 判兼容 + 自动分辨厂商 + 完整 URL 注册建议；加 `--pricing [--pricing-token] [--markup]` 一并抓上游成本并算建议售价（含并发与图片实测）。
+- `scripts/fetch_pricing.py` —— 抓中转 `/api/pricing` 上游成本（new-api 格式，折人民币）：自动猜 API/根域名、支持系统访问令牌；被 probe 复用，也可单独跑。
 - `scripts/usd_to_cny.py` —— 美元定价按汇率折人民币。

@@ -15,10 +15,18 @@ Notes:
 """
 import argparse
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+
+# 复用同目录的价格抓取（new-api /api/pricing → 上游成本）。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from fetch_pricing import fetch_pricing_map
+except Exception:  # 脚本被单独拷走时不致崩
+    fetch_pricing_map = None
 
 
 # 检测到的认证方式，被所有请求复用（main 里先 detect_auth 设定）。
@@ -406,6 +414,35 @@ def register_hint(base, model, mtype, auth="bearer", owned_by=""):
     return h
 
 
+def attach_pricing(results, pmap, markup):
+    """把抓到的上游成本并进每个模型的 register_hint，并按加价率给出建议售价。
+    pmap: {model_name -> 成本行}; markup: 如 0.2 表示加价 20%（None=不建议售价）。"""
+    # 大小写不敏感的成本查找。
+    low = {k.lower(): v for k, v in pmap.items()}
+    mult = (1 + markup) if markup is not None else None
+    for r in results:
+        h = r.get("register_hint", {})
+        cost = pmap.get(r["model"]) or low.get(r["model"].lower())
+        if not cost:
+            h["pricing_basis"] = "未抓到该模型成本，请向供应商手填"
+            continue
+        h["pricing_basis"] = "来自中转 /api/pricing"
+        ic, oc = cost.get("upstream_input_cost"), cost.get("upstream_output_cost")
+        cc = cost.get("call_cost_cny")
+        if ic is not None:  # token 计费
+            h["upstream_input_cost"] = ic
+            h["upstream_output_cost"] = oc
+            if mult is not None:
+                h["suggested_input_price"] = round(ic * mult, 4)
+                h["suggested_output_price"] = round((oc or 0) * mult, 4)
+        elif cc is not None:  # 按次/图片：上游成本无对应存储字段，仅给建议售价
+            h["upstream_call_cost_note"] = f"上游约 ¥{cc}/次，注册接口无 upstream call cost 字段，不入库"
+            if mult is not None:
+                key = "suggested_image_price" if h.get("billing_type") == "image" else "suggested_call_price"
+                h[key] = round(cc * mult, 4)
+    return results
+
+
 def probe_one(base, key, model, mtype, do_image, auth="bearer", owned_by=""):
     r = {"model": model, "model_type": mtype, "models": {"ok": True}}
     if mtype == "chat":
@@ -440,6 +477,10 @@ def main():
     ap.add_argument("--model", help="只探测这一个模型；不传则探测 /models 发现的**全部**模型")
     ap.add_argument("--image", action="store_true", help="探测图片模型（文生图+图生图，会产生真实费用）")
     ap.add_argument("--concurrency", type=int, default=5, help="并发探测的模型数（默认5；上游限流严就调小到1-2）")
+    ap.add_argument("--pricing", action="store_true", help="同时抓上游成本（中转 /api/pricing），并进每个模型的注册建议")
+    ap.add_argument("--pricing-token", default="", help="中转「系统访问令牌」（非 sk- key）；公开 pricing 可不填")
+    ap.add_argument("--markup", type=float, help="加价率，如 0.2=加价20%%；给了就按成本自动算建议售价")
+    ap.add_argument("--rate", type=float, default=7.2, help="USD->CNY 汇率（中转价基本按美元，默认7.2）")
     args = ap.parse_args()
     raw_base = args.base.rstrip("/")
 
@@ -471,6 +512,18 @@ def main():
     else:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             report["results"] = list(ex.map(_probe, targets))
+
+    # 抓上游成本并算建议售价（一次抓取，并进所有模型）
+    if args.pricing:
+        if fetch_pricing_map is None:
+            report["pricing"] = {"source": None, "note": "fetch_pricing 模块不可用（脚本被单独拷走？）"}
+        else:
+            pmap, meta = fetch_pricing_map(raw_base, args.pricing_token, args.rate)
+            attach_pricing(report["results"], pmap, args.markup)
+            report["pricing"] = {"source": meta.get("source"), "note": meta.get("note", ""),
+                                 "matched": sum(1 for r in report["results"]
+                                                if r["register_hint"].get("pricing_basis", "").startswith("来自")),
+                                 "rate": args.rate, "markup": args.markup}
 
     # 汇总
     report["summary"] = {
