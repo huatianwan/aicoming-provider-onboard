@@ -57,6 +57,7 @@ python scripts/probe_upstream.py --base <BASE_URL> --key <KEY> --pricing [--pric
 
 ### A3. 把计划表讲给供应商，敲定价格
 逐模型用中文列出：✅compatible / ⚠️needs_attention / ❌unusable（按实测，不看名字），加每个的**成本 + 建议售价**。
+- **❌unusable / ⚠️needs_attention 的模型——主动告诉供应商怎么改，别只报"不兼容"**：拿该模型 `assessment.issues` 里的每条症状，对照 `references/adaptation-guide.md` 的「对症适配表」，把**原因 + 在你上游怎么改 + 自测 curl** 讲清楚（适配在供应商侧做，平台不为单家改）。常见：主接口非 200（路径/认证/格式）、响应非 OpenAI 结构（原生协议需供应商提供 OpenAI 格式入口）、流式缺 usage、图生图 edits 不同级。供应商改好、用自测 curl 跑通后，重跑探测确认 ✅ 再提交。
 - **抓到成本** → 给出建议售价（成本×(1+加价)），让供应商确认或改加价率。
 - **成本没抓到时的兜底阶梯**（`pricing_basis=需手填` 的模型，**逐级往下试，都是要真实数据、不猜价**）：
   1. 让供应商提供中转的**「系统访问令牌」**→ 重跑加 `--pricing-token`（多数 new-api 这步就拿到了）。
@@ -135,6 +136,7 @@ curl -sS -X DELETE https://api.aicoming.top/api/v1/provider/models/<ID> -H "Auth
 
 - `references/onboard-api.md` —— 登录、提交、变更、下架/删除接口的真实字段、鉴权、状态机、完整 URL 约定。
 - `references/aicoming-contract.md` —— 接入契约、5 条适配点、图片/edit 规则、兼容判定（仅探测时需要）。
+- `references/adaptation-guide.md` —— **供应商面向的适配手册**：拆包后请求形态 + 对症适配表（探测症状→怎么改）+ 自测 curl。模型不兼容/有警告时发给供应商照着改。
 - `scripts/probe_upstream.py` —— 提交主力：全量发现模型 + 判兼容 + 自动分辨厂商 + 完整 URL 注册建议；加 `--pricing [--pricing-token] [--markup]` 一并抓上游成本并算建议售价（含并发与图片实测）。
 - `scripts/fetch_pricing.py` —— 多平台抓上游成本（折人民币）：认 ① /v1/models 内联价(OpenRouter/LiteLLM)、② new-api/one-api `/api/pricing`(比率,支持系统访问令牌、自动猜 API/根域名)、③ 供应商给的单个价目 URL(`--url`)；被 probe 复用，也可单独跑。
 - `scripts/usd_to_cny.py` —— 美元定价按汇率折人民币。
